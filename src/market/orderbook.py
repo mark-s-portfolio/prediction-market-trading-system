@@ -396,54 +396,32 @@ class OrderBookStore:
         best_ask: Optional[float],
         timestamp: Optional[float] = None,
     ) -> Optional[OrderBookSnapshot]:
-        """Publish top prices while refusing to fabricate ladder depth.
+        """Publish top prices without carrying stale ladder depth forward.
 
-        Existing WS depth at the top level may be retained only when the prior
-        snapshot itself had proven WS depth.  Otherwise placeholder size is marked
-        synthetic and cannot be mistaken for execution-quality depth.
+        A top-of-book event proves only the reported best prices. It does not
+        prove that any previously observed deeper levels still exist, nor does it
+        refresh their sizes. The stored snapshot is therefore deliberately
+        synthetic, one level per reported side, and never depth-proven.
         """
 
         token_id = str(token_id or "").strip()
         if not token_id:
             return None
 
-        previous = self._ws_books.get(token_id)
-        prior_depth = bool(previous and previous.depth_proven)
-
-        bids = list(previous.bids) if previous else []
-        asks = list(previous.asks) if previous else []
+        bids: list[BookLevel] = []
+        asks: list[BookLevel] = []
 
         if best_bid is not None:
             bid_px = float(best_bid)
             if not math.isfinite(bid_px) or bid_px <= 0.0:
                 return None
-
-            retained_size = (
-                previous.best_bid.size
-                if prior_depth and previous and previous.best_bid is not None
-                else 1.0
-            )
-            level = BookLevel(bid_px, retained_size)
-            if bids:
-                bids[0] = level
-            else:
-                bids = [level]
+            bids.append(BookLevel(bid_px, 1.0))
 
         if best_ask is not None:
             ask_px = float(best_ask)
             if not math.isfinite(ask_px) or ask_px <= 0.0:
                 return None
-
-            retained_size = (
-                previous.best_ask.size
-                if prior_depth and previous and previous.best_ask is not None
-                else 1.0
-            )
-            level = BookLevel(ask_px, retained_size)
-            if asks:
-                asks[0] = level
-            else:
-                asks = [level]
+            asks.append(BookLevel(ask_px, 1.0))
 
         if not bids and not asks:
             return None
@@ -452,12 +430,12 @@ class OrderBookStore:
 
         snapshot = OrderBookSnapshot(
             token_id=token_id,
-            bids=tuple(sorted(bids, key=lambda level: level.price, reverse=True)),
-            asks=tuple(sorted(asks, key=lambda level: level.price)),
+            bids=tuple(bids),
+            asks=tuple(asks),
             timestamp=ts,
             source=BookSource.WEBSOCKET,
-            depth_proven=prior_depth,
-            synthetic_depth=not prior_depth,
+            depth_proven=False,
+            synthetic_depth=True,
         )
 
         self._ws_books[token_id] = snapshot

@@ -764,7 +764,10 @@ def _row_evidence_id(
     ):
         value = str(row.get(key) or "").strip()
         if value:
-            return f"{list_key}:{value}"
+            # Venue-native execution identity is independent of which response
+            # alias exposed the row (e.g. "fills" vs "trades"). Prefixing the
+            # container name would double-count the same execution.
+            return f"native:{value}"
 
     fingerprint_payload = {
         "order_id": order_id,

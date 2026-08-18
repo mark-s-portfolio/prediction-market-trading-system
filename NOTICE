@@ -1,0 +1,18 @@
+Prediction Market Trading System — Public Portfolio Snapshot
+
+This repository is a sanitized derivative of a larger private software system.
+It is published for portfolio and code-review purposes.
+
+Intentionally excluded or generalized:
+- production trading parameters and sizing rules
+- asset-specific setup families
+- historical GOOD/BAD trade corpora
+- proprietary admission thresholds and strategy logic
+- private operational data, credentials, and production logs
+
+The standalone public entrypoint is intentionally observe-only and does not
+provide turnkey live trading behavior.
+
+Third-party libraries and services remain subject to their respective licenses
+and terms. No license to proprietary/private strategy material is granted by
+this repository.

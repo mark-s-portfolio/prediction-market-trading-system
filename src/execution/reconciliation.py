@@ -513,8 +513,8 @@ class ReconciliationService:
 
                 if located_id:
                     order_id = located_id
-                    status_payload = located
                     status_observed = _mapping_has_status_evidence(located)
+                    status_payload = located if status_observed else None
                     notes.append("exact_order_recovered_by_locator")
                 else:
                     notes.append("locator_returned_no_exact_order_id")
@@ -619,6 +619,22 @@ class ReconciliationService:
             observed = _mapping_has_status_evidence(payload)
 
             if observed:
+                payload_order_id = ""
+                if isinstance(payload, Mapping):
+                    payload_order_id = str(
+                        payload.get("orderID")
+                        or payload.get("order_id")
+                        or payload.get("id")
+                        or payload.get("orderId")
+                        or ""
+                    ).strip()
+
+                if payload_order_id and payload_order_id != order_id:
+                    notes.append("status_order_id_mismatch")
+                    if attempt < attempts and retry_delay > 0.0:
+                        await asyncio.sleep(retry_delay)
+                    continue
+
                 status_observed = True
                 status_payload = payload
 
@@ -856,22 +872,28 @@ class ReconciliationService:
                     reason="exact trade evidence overrides terminal-zero candidate",
                 )
 
-        # Exact persisted terminal proof can supplement a status label, but never
-        # substitutes for same-token inventory proof.
+        # Terminal-zero has an explicit semantic class. A generic durable
+        # "terminal" proof cannot turn contradictory FILLED+zero evidence into
+        # CANCELLED/REJECTED zero semantics.
         terminal_proven = bool(
             _terminal_cancel_state(status_snapshot.state)
             or _terminal_reject_state(status_snapshot.state)
         )
 
         if not terminal_proven:
+            durable_terminal = False
             try:
-                terminal_proven = await self._read_terminal_proof(order_id)
+                durable_terminal = await self._read_terminal_proof(order_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 notes.append(f"terminal_proof_error:{type(exc).__name__}")
 
-        if not terminal_proven:
+            if durable_terminal:
+                notes.append(
+                    "durable_terminal_proof_without_zero_classification"
+                )
+
             evidence = ReconciliationEvidence(
                 lifecycle=lifecycle_identity,
                 order_id=order_id,
@@ -902,7 +924,7 @@ class ReconciliationService:
                 order_id=order_id,
                 snapshot=status_snapshot,
                 evidence=evidence,
-                reason="terminal order state not proven",
+                reason="terminal status lacks cancel/reject zero classification",
             )
 
         # Terminal + zero matched still requires a fresh same-token inventory proof.

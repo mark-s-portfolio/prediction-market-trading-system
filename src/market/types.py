@@ -178,3 +178,129 @@ class OrderBookSnapshot:
 @dataclass(frozen=True, slots=True)
 class MarketDefinition:
     """Canonical identity and venue metadata for a binary market."""
+
+    slug: str
+    question: str
+    yes_token: str
+    no_token: str
+    condition_id: str
+    interval_minutes: int
+    end_time: datetime
+    tick_size: Optional[float] = None
+    neg_risk: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        slug = str(self.slug or "").strip()
+        question = str(self.question or "").strip()
+        yes_token = str(self.yes_token or "").strip()
+        no_token = str(self.no_token or "").strip()
+        condition_id = str(self.condition_id or "").strip()
+        interval = int(self.interval_minutes)
+
+        if not slug:
+            raise ValueError("slug is required")
+        if not question:
+            raise ValueError("question is required")
+        if not yes_token or not no_token:
+            raise ValueError("both YES and NO token ids are required")
+        if yes_token == no_token:
+            raise ValueError("YES and NO token ids must be different")
+        if not condition_id:
+            raise ValueError("condition_id is required")
+        if interval <= 0:
+            raise ValueError("interval_minutes must be positive")
+
+        end_time = self.end_time
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        else:
+            end_time = end_time.astimezone(timezone.utc)
+
+        tick_size = self.tick_size
+        if tick_size is not None:
+            tick_size = float(tick_size)
+            if not math.isfinite(tick_size) or tick_size <= 0.0:
+                raise ValueError("tick_size must be positive")
+
+        object.__setattr__(self, "slug", slug)
+        object.__setattr__(self, "question", question)
+        object.__setattr__(self, "yes_token", yes_token)
+        object.__setattr__(self, "no_token", no_token)
+        object.__setattr__(self, "condition_id", condition_id)
+        object.__setattr__(self, "interval_minutes", interval)
+        object.__setattr__(self, "end_time", end_time)
+        object.__setattr__(self, "tick_size", tick_size)
+
+    @property
+    def pair_key(self) -> str:
+        return self.slug
+
+    def token_for(self, side: OutcomeSide | str) -> str:
+        normalized = side if isinstance(side, OutcomeSide) else OutcomeSide.from_value(side)
+        return self.yes_token if normalized is OutcomeSide.YES else self.no_token
+
+    def side_for_token(self, token_id: str) -> OutcomeSide:
+        token = str(token_id or "")
+        if token == self.yes_token:
+            return OutcomeSide.YES
+        if token == self.no_token:
+            return OutcomeSide.NO
+        raise KeyError(f"token does not belong to market {self.slug}: {token}")
+
+    def contains_token(self, token_id: str) -> bool:
+        token = str(token_id or "")
+        return token in {self.yes_token, self.no_token}
+
+    def time_left_seconds(self, now: datetime) -> float:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
+        return max(0.0, (self.end_time - now).total_seconds())
+
+
+@dataclass(frozen=True, slots=True)
+class MarketBooks:
+    """Current YES/NO order-book view for one binary market."""
+
+    market: MarketDefinition
+    yes: OrderBookSnapshot
+    no: OrderBookSnapshot
+
+    def __post_init__(self) -> None:
+        if self.yes.token_id != self.market.yes_token:
+            raise ValueError("YES book token does not match market definition")
+        if self.no.token_id != self.market.no_token:
+            raise ValueError("NO book token does not match market definition")
+
+    @property
+    def both_two_sided(self) -> bool:
+        return self.yes.is_two_sided and self.no.is_two_sided
+
+    @property
+    def newest_timestamp(self) -> float:
+        return max(self.yes.timestamp, self.no.timestamp)
+
+    @property
+    def oldest_timestamp(self) -> float:
+        return min(self.yes.timestamp, self.no.timestamp)
+
+
+@dataclass(frozen=True, slots=True)
+class MarketResolution:
+    """Explicit venue-confirmed binary market resolution."""
+
+    market: MarketDefinition
+    confirmed: bool
+    yes_price: Optional[float] = None
+    no_price: Optional[float] = None
+
+    @property
+    def winning_side(self) -> Optional[OutcomeSide]:
+        if not self.confirmed:
+            return None
+        if self.yes_price == 1.0 and self.no_price == 0.0:
+            return OutcomeSide.YES
+        if self.no_price == 1.0 and self.yes_price == 0.0:
+            return OutcomeSide.NO
+        return None

@@ -440,15 +440,34 @@ class OrderLifecycleService:
             existing = self._entries.get(key)
 
             if existing is not None:
-                current = existing.working_order.intent.lifecycle
+                current_intent = existing.working_order.intent
+                current = current_intent.lifecycle
+                requested = intent.lifecycle
 
-                if current == intent.lifecycle:
+                if current.attempt_id != requested.attempt_id:
+                    raise LifecycleConflict(
+                        f"attempt mismatch for lifecycle {key}: "
+                        f"{current.attempt_id} != {requested.attempt_id}"
+                    )
+
+                if current == requested:
+                    if current_intent != intent:
+                        raise LifecycleConflict(
+                            f"lifecycle {key} identity is already bound to "
+                            "a different order intent"
+                        )
                     return existing.snapshot()
 
-                if current.generation > intent.lifecycle.generation:
+                if current.generation > requested.generation:
                     raise StaleLifecycleGeneration(
                         f"lifecycle {key} already at generation "
                         f"{current.generation}"
+                    )
+
+                if current.generation == requested.generation:
+                    raise LifecycleConflict(
+                        f"lifecycle {key} generation {current.generation} "
+                        "is already bound"
                     )
 
                 if existing.working_order.owns_lifecycle:
@@ -456,6 +475,25 @@ class OrderLifecycleService:
                         f"cannot replace owned lifecycle {key} "
                         f"state={existing.working_order.state.value}"
                     )
+
+                if existing.raw_post_entered:
+                    recon = existing.last_reconciliation
+                    if (
+                        recon is None
+                        or recon.outcome
+                        not in {
+                            ReconciliationOutcome.CANCELLED_ZERO_FILL,
+                            ReconciliationOutcome.REJECTED_ZERO_FILL,
+                        }
+                    ):
+                        raise LifecycleConflict(
+                            f"cannot replace raw-post lifecycle {key} "
+                            "without terminal-zero reconciliation proof"
+                        )
+
+                old_order_id = existing.working_order.order_id
+                if old_order_id:
+                    self._lifecycle_by_order_id.pop(old_order_id, None)
 
             working = WorkingOrder(
                 intent=intent,
@@ -650,14 +688,18 @@ class OrderLifecycleService:
             entry = self._require_entry(intent.lifecycle)
             self._assert_generation(entry, intent.lifecycle)
 
-            if entry.working_order.owns_lifecycle and entry.working_order.state not in {
-                OrderLifecycleState.CREATED,
-                OrderLifecycleState.SIGNING,
-                OrderLifecycleState.SUBMITTING,
-            }:
+            if (
+                entry.last_submission is not None
+                or entry.raw_post_entered
+                or entry.working_order.state
+                not in {
+                    OrderLifecycleState.CREATED,
+                    OrderLifecycleState.SIGNING,
+                }
+            ):
                 raise LifecycleConflict(
-                    f"lifecycle already owned in state "
-                    f"{entry.working_order.state.value}"
+                    "lifecycle generation already received a submission handoff "
+                    f"(state={entry.working_order.state.value})"
                 )
 
             self._set_working(
@@ -957,6 +999,12 @@ class OrderLifecycleService:
 
             intent = entry.working_order.intent
 
+        payload_order_id = _extract_order_id(payload)
+        if payload_order_id and payload_order_id != order_id:
+            raise LifecycleConflict(
+                "status result order ID does not match lifecycle owner"
+            )
+
         snapshot = normalize_venue_order_snapshot(
             payload,
             intent=intent,
@@ -968,25 +1016,52 @@ class OrderLifecycleService:
         with self._gate:
             entry = self._require_entry(lifecycle)
             self._assert_generation(entry, lifecycle)
+            current = entry.working_order
 
-            if entry.working_order.order_id != snapshot.order_id:
+            if current.order_id != snapshot.order_id:
                 raise LifecycleConflict(
                     "status result order ID does not match lifecycle owner"
                 )
 
+            observed_filled = float(snapshot.matched_size)
+            current_filled = float(current.filled_size)
+            stale_quantity = observed_filled + 1e-9 < current_filled
+            next_filled = max(current_filled, observed_filled)
+
+            next_state = snapshot.state
+            if stale_quantity:
+                next_state = current.state
+            elif current.state is OrderLifecycleState.FILLED:
+                next_state = OrderLifecycleState.FILLED
+            elif current.state.is_terminal and not snapshot.state.is_terminal:
+                next_state = current.state
+            elif (
+                current.state is OrderLifecycleState.PARTIALLY_FILLED
+                and snapshot.state is OrderLifecycleState.WORKING
+                and next_filled > 0.0
+            ):
+                next_state = OrderLifecycleState.PARTIALLY_FILLED
+
+            next_average = current.average_fill_price
+            if (
+                not stale_quantity
+                and snapshot.average_fill_price is not None
+            ):
+                next_average = snapshot.average_fill_price
+
             self._set_working(
                 entry,
-                state=snapshot.state,
+                state=next_state,
                 order_id=snapshot.order_id,
-                filled_size=snapshot.matched_size,
-                average_fill_price=snapshot.average_fill_price,
+                filled_size=next_filled,
+                average_fill_price=next_average,
                 reason=f"status:{snapshot.raw_status or snapshot.state.value}",
             )
             self._emit(
                 entry,
                 (
                     LifecycleEventType.TERMINAL
-                    if snapshot.state.is_terminal
+                    if next_state.is_terminal
                     else LifecycleEventType.STATUS_OBSERVED
                 ),
                 reason=entry.last_reason,
@@ -1112,23 +1187,79 @@ class OrderLifecycleService:
 
             return result
 
-        # A cancel request response can be venue/version specific.  It proves that
-        # the request returned successfully, but NOT that matched quantity was zero.
+        # A transport-level success is not itself proof that cancellation won.
+        # Classify only explicit terminal status or an explicit cancel ack.
         status_snapshot = None
+        explicit_cancel_ack = False
 
         if isinstance(response, Mapping):
+            payload_order_id = _extract_order_id(response)
+            if payload_order_id and payload_order_id != order_id:
+                raise LifecycleConflict(
+                    "cancel response order ID does not match lifecycle owner"
+                )
+
             status_snapshot = normalize_venue_order_snapshot(
                 response,
                 intent=self.get(lifecycle).working_order.intent,
                 order_id=order_id,
             )
 
+            cancelled_values = response.get(
+                "canceled",
+                response.get("cancelled"),
+            )
+            if isinstance(cancelled_values, (list, tuple, set)):
+                explicit_cancel_ack = order_id in {
+                    str(value) for value in cancelled_values
+                }
+            elif cancelled_values is True:
+                explicit_cancel_ack = True
+
+        elif response is True:
+            explicit_cancel_ack = True
+
+        terminal_state = (
+            status_snapshot.state
+            if status_snapshot is not None
+            else None
+        )
+
+        confirmed_cancelled = bool(
+            explicit_cancel_ack
+            or terminal_state is OrderLifecycleState.CANCELLED
+        )
+        already_terminal = bool(
+            terminal_state in {
+                OrderLifecycleState.FILLED,
+                OrderLifecycleState.REJECTED,
+                OrderLifecycleState.FAILED,
+                OrderLifecycleState.CLOSED,
+            }
+        )
+
+        if confirmed_cancelled:
+            outcome = CancellationOutcome.CONFIRMED_CANCELLED
+            next_state = OrderLifecycleState.CANCELLED
+            reason = "explicit cancellation acknowledgement"
+            event_type = LifecycleEventType.CANCEL_CONFIRMED
+        elif already_terminal:
+            outcome = CancellationOutcome.ALREADY_TERMINAL
+            next_state = terminal_state
+            reason = f"venue reported terminal state {terminal_state.value}"
+            event_type = LifecycleEventType.TERMINAL
+        else:
+            outcome = CancellationOutcome.UNKNOWN
+            next_state = OrderLifecycleState.CANCEL_UNKNOWN
+            reason = "cancel request returned without terminal cancellation proof"
+            event_type = LifecycleEventType.CANCEL_UNKNOWN
+
         result = CancellationResult(
-            outcome=CancellationOutcome.CONFIRMED_CANCELLED,
+            outcome=outcome,
             order_id=order_id,
             lifecycle=lifecycle,
             venue_snapshot=status_snapshot,
-            reason="cancel request returned successfully",
+            reason=reason,
         )
 
         with self._gate:
@@ -1136,19 +1267,26 @@ class OrderLifecycleService:
             self._assert_generation(entry, lifecycle)
 
             filled = (
-                status_snapshot.matched_size
+                max(
+                    entry.working_order.filled_size,
+                    status_snapshot.matched_size,
+                )
                 if status_snapshot is not None
                 else entry.working_order.filled_size
             )
-            average = (
-                status_snapshot.average_fill_price
-                if status_snapshot is not None
-                else entry.working_order.average_fill_price
-            )
+            average = entry.working_order.average_fill_price
+            if (
+                status_snapshot is not None
+                and status_snapshot.matched_size
+                + 1e-9
+                >= entry.working_order.filled_size
+                and status_snapshot.average_fill_price is not None
+            ):
+                average = status_snapshot.average_fill_price
 
             self._set_working(
                 entry,
-                state=OrderLifecycleState.CANCELLED,
+                state=next_state,
                 order_id=order_id,
                 filled_size=filled,
                 average_fill_price=average,
@@ -1157,7 +1295,7 @@ class OrderLifecycleService:
             entry.last_cancellation = result
             self._emit(
                 entry,
-                LifecycleEventType.CANCEL_CONFIRMED,
+                event_type,
                 reason=result.reason,
             )
 
@@ -1245,7 +1383,24 @@ class OrderLifecycleService:
                     raise LifecycleConflict(
                         "PARTIALLY_FILLED reconciliation requires fill quantity"
                     )
-                next_state = OrderLifecycleState.PARTIALLY_FILLED
+                if (
+                    snapshot is not None
+                    and snapshot.state
+                    in {
+                        OrderLifecycleState.CANCELLED,
+                        OrderLifecycleState.REJECTED,
+                        OrderLifecycleState.FAILED,
+                    }
+                ):
+                    next_state = snapshot.state
+                elif current.state in {
+                    OrderLifecycleState.CANCELLED,
+                    OrderLifecycleState.REJECTED,
+                    OrderLifecycleState.FAILED,
+                }:
+                    next_state = current.state
+                else:
+                    next_state = OrderLifecycleState.PARTIALLY_FILLED
 
             elif result.outcome is ReconciliationOutcome.FILLED:
                 if not order_id:
@@ -1381,6 +1536,21 @@ class OrderLifecycleService:
                     f"cannot supersede owned state "
                     f"{entry.working_order.state.value}"
                 )
+
+            if entry.raw_post_entered:
+                recon = entry.last_reconciliation
+                if (
+                    recon is None
+                    or recon.outcome
+                    not in {
+                        ReconciliationOutcome.CANCELLED_ZERO_FILL,
+                        ReconciliationOutcome.REJECTED_ZERO_FILL,
+                    }
+                ):
+                    raise LifecycleConflict(
+                        "cannot supersede raw-post lifecycle without "
+                        "terminal-zero reconciliation proof"
+                    )
 
             old_order_id = entry.working_order.order_id
             if old_order_id:

@@ -857,11 +857,7 @@ class TradingEngine:
             key = market.pair_key
             previous = self._current_books.get(key)
 
-            if (
-                previous is None
-                or previous.yes.timestamp != books.yes.timestamp
-                or previous.no.timestamp != books.no.timestamp
-            ):
+            if previous is None or previous != books:
                 self._market_generation[key] = (
                     self._market_generation.get(key, 0) + 1
                 )

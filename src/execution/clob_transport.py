@@ -695,6 +695,7 @@ class ClobTransport:
             if wait_for_gap > 0.0:
                 time.sleep(wait_for_gap)
 
+            network_attempted = False
             try:
                 with self._sdk_instance_gate:
                     # This is the exact last networkless observation point.
@@ -707,6 +708,7 @@ class ClobTransport:
                         )
 
                     try:
+                        network_attempted = True
                         return fn(*args, **kwargs)
                     except Exception as exc:
                         stage = (
@@ -721,8 +723,9 @@ class ClobTransport:
                             transient=self._is_transient_error(exc),
                         ) from exc
             finally:
-                with self._state_gate:
-                    self._last_network_call_ts = time.monotonic()
+                if network_attempted:
+                    with self._state_gate:
+                        self._last_network_call_ts = time.monotonic()
         finally:
             self._release_transport_slot()
 

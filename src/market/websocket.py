@@ -87,6 +87,12 @@ class WebSocketPolicy:
     cooperative_yield_every_frames: int = 16
     cooperative_yield_max_work_seconds: float = 0.004
 
+    # Handler delivery is isolated from the socket receiver. When the bounded
+    # queue is saturated, the oldest notification is coalesced away; the
+    # OrderBookStore already contains the newer normalized state.
+    event_queue_max: int = 1024
+    event_shutdown_drain_seconds: float = 1.0
+
 
 @dataclass(frozen=True, slots=True)
 class WebSocketStats:
@@ -96,6 +102,7 @@ class WebSocketStats:
     duplicate_frames_dropped: int
     parse_errors: int
     reconnects: int
+    handler_events_dropped: int
     initial_books_seen: int
     subscribed_tokens: int
     last_message_age_seconds: float
@@ -159,6 +166,12 @@ class MarketWebSocketClient:
         self._duplicate_frames_dropped = 0
         self._parse_errors = 0
         self._reconnects = 0
+        self._handler_events_dropped = 0
+
+        self._event_queue: asyncio.Queue[MarketDataEvent] = asyncio.Queue(
+            maxsize=max(1, int(self.policy.event_queue_max))
+        )
+        self._event_worker_task: Optional[asyncio.Task] = None
 
         self._initial_book_seen: set[str] = set()
         self._last_message_time = 0.0
@@ -225,25 +238,109 @@ class MarketWebSocketClient:
             duplicate_frames_dropped=self._duplicate_frames_dropped,
             parse_errors=self._parse_errors,
             reconnects=self._reconnects,
+            handler_events_dropped=self._handler_events_dropped,
             initial_books_seen=len(self._initial_book_seen),
             subscribed_tokens=len(self._tokens),
             last_message_age_seconds=age,
         )
 
-    async def _emit(self, event: MarketDataEvent) -> None:
-        handler = self.event_handler
-        if handler is None:
+    def _ensure_event_worker(self) -> None:
+        if self.event_handler is None:
             return
 
+        task = self._event_worker_task
+        if task is not None and not task.done():
+            return
+
+        self._event_worker_task = asyncio.create_task(
+            self._event_worker(),
+            name="market-ws-event-handler",
+        )
+
+    async def _event_worker(self) -> None:
+        while True:
+            event = await self._event_queue.get()
+            try:
+                handler = self.event_handler
+                if handler is None:
+                    continue
+
+                try:
+                    result = handler(event)
+                    if inspect.isawaitable(result):
+                        await result
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    runtime_print(
+                        f"[websocket] event handler error: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            finally:
+                self._event_queue.task_done()
+
+    async def _shutdown_event_worker(self) -> None:
+        task = self._event_worker_task
+        if task is None:
+            return
+
+        drain = max(
+            0.0,
+            float(self.policy.event_shutdown_drain_seconds),
+        )
+        if drain > 0.0 and not task.done():
+            try:
+                await asyncio.wait_for(
+                    self._event_queue.join(),
+                    timeout=drain,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        if not task.done():
+            task.cancel()
+
+        await asyncio.gather(task, return_exceptions=True)
+        self._event_worker_task = None
+
+        # Balance unfinished-task accounting for notifications intentionally
+        # discarded during shutdown.
+        while True:
+            try:
+                self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._event_queue.task_done()
+
+    async def _emit(self, event: MarketDataEvent) -> None:
+        if self.event_handler is None:
+            return
+
+        self._ensure_event_worker()
+
         try:
-            result = handler(event)
-            if inspect.isawaitable(result):
-                await result
-        except Exception as exc:
-            runtime_print(
-                f"[websocket] event handler error: "
-                f"{type(exc).__name__}: {exc}"
-            )
+            self._event_queue.put_nowait(event)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        # The normalized market state is already committed to OrderBookStore.
+        # Coalesce the oldest notification rather than blocking socket receive
+        # on an arbitrarily slow async consumer.
+        try:
+            self._event_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        else:
+            self._event_queue.task_done()
+            self._handler_events_dropped += 1
+
+        try:
+            self._event_queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # A concurrent producer won the slot; preserve receive-loop liveness.
+            self._handler_events_dropped += 1
 
     async def _emit_connection(
         self,
@@ -316,6 +413,7 @@ class MarketWebSocketClient:
                 await asyncio.sleep(reconnect_delay)
 
         await self._emit_connection(ConnectionState.STOPPED, "client stopped")
+        await self._shutdown_event_worker()
 
     async def _run_connection(self) -> None:
         self._connection_generation += 1

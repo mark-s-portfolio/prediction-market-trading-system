@@ -926,6 +926,27 @@ class AdmissionPolicy:
             )
         )
 
+        expected_unit_cost = (
+            candidate.quote.limit_price
+            if proposal.action.creates_exposure
+            else None
+        )
+        unit_cost_ok = bool(
+            (
+                expected_unit_cost is None
+                and proposal.estimated_unit_cost is None
+            )
+            or (
+                expected_unit_cost is not None
+                and proposal.estimated_unit_cost is not None
+                and abs(
+                    proposal.estimated_unit_cost
+                    - expected_unit_cost
+                )
+                <= 1e-12
+            )
+        )
+
         subject_ok = bool(
             proposal.token_id == candidate.token_id
             and proposal.market_id == candidate.market_id
@@ -938,6 +959,7 @@ class AdmissionPolicy:
                 proposal.quantity - candidate.quote.quantity
             )
             <= 1e-9
+            and unit_cost_ok
         )
         checks.append(
             AdmissionCheck(
@@ -962,34 +984,58 @@ class AdmissionPolicy:
                         else None
                     ),
                     "quantity": proposal.quantity,
+                    "estimated_unit_cost": proposal.estimated_unit_cost,
                 },
                 expected={
                     "token_id": candidate.token_id,
                     "market_id": candidate.market_id,
                     "outcome_side": candidate.subject.outcome_side.value,
                     "quantity": candidate.quote.quantity,
+                    "estimated_unit_cost": expected_unit_cost,
                 },
                 source="risk.proposal",
             )
         )
 
-        risk_action_ok = risk.action is proposal.action
+        risk_proposal_ok = risk.proposal == proposal
         checks.append(
             AdmissionCheck(
-                rule_id="binding.risk_decision_action",
+                rule_id="binding.risk_decision_proposal",
                 status=(
                     CheckStatus.PASS
-                    if risk_action_ok
+                    if risk_proposal_ok
                     else CheckStatus.FAIL
                 ),
                 failure_disposition=FailureDisposition.DENY,
                 reason=(
-                    "risk decision action matches proposal"
-                    if risk_action_ok
-                    else "risk decision action mismatch"
+                    "risk decision bound to exact proposal"
+                    if risk_proposal_ok
+                    else "risk decision/proposal binding mismatch"
                 ),
-                observed=risk.action.value,
-                expected=proposal.action.value,
+                observed={
+                    "action": risk.proposal.action.value,
+                    "token_id": risk.proposal.token_id,
+                    "market_id": risk.proposal.market_id,
+                    "outcome_side": (
+                        risk.proposal.outcome_side.value
+                        if risk.proposal.outcome_side is not None
+                        else None
+                    ),
+                    "quantity": risk.proposal.quantity,
+                    "estimated_unit_cost": risk.proposal.estimated_unit_cost,
+                },
+                expected={
+                    "action": proposal.action.value,
+                    "token_id": proposal.token_id,
+                    "market_id": proposal.market_id,
+                    "outcome_side": (
+                        proposal.outcome_side.value
+                        if proposal.outcome_side is not None
+                        else None
+                    ),
+                    "quantity": proposal.quantity,
+                    "estimated_unit_cost": proposal.estimated_unit_cost,
+                },
                 source="risk.decision",
             )
         )
@@ -1270,6 +1316,16 @@ class AdmissionPermitLedger:
             )
 
         with self._gate:
+            if permit.expired():
+                raise ValueError(
+                    "expired admission permit cannot be registered"
+                )
+
+            if permit.permit_id in self._consumed:
+                raise ValueError(
+                    "consumed admission permit cannot be registered again"
+                )
+
             existing = self._permits.get(permit.permit_id)
 
             if existing is not None and existing != permit:

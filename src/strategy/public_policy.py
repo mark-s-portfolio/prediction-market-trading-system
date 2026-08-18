@@ -552,6 +552,7 @@ class AdmissionTransportBridge:
 
         # Diagnostic only: the ledger is still the one-shot authority owner.
         self._gate = threading.RLock()
+        self._prepared_lifecycle_by_permit: dict[str, str] = {}
         self._last_consumed_permit_id: Optional[str] = None
         self._last_consumed_at: Optional[float] = None
 
@@ -582,7 +583,24 @@ class AdmissionTransportBridge:
         if self.ledger.consumed(permit.permit_id) is not None:
             raise ValueError("admission permit was already consumed")
 
-        permit = self.ledger.register(decision)
+        lifecycle_id = str(lifecycle_id or "").strip()
+        if not lifecycle_id:
+            raise ValueError("lifecycle_id is required")
+
+        with self._gate:
+            prepared_for = self._prepared_lifecycle_by_permit.get(
+                permit.permit_id
+            )
+            if prepared_for is not None:
+                raise ValueError(
+                    "admission permit already prepared for lifecycle "
+                    f"{prepared_for}"
+                )
+
+            permit = self.ledger.register(decision)
+            self._prepared_lifecycle_by_permit[
+                permit.permit_id
+            ] = lifecycle_id
 
         context = build_pre_submit_context(
             candidate=candidate,
@@ -610,6 +628,10 @@ class AdmissionTransportBridge:
             )
 
             with self._gate:
+                self._prepared_lifecycle_by_permit.pop(
+                    permit.permit_id,
+                    None,
+                )
                 self._last_consumed_permit_id = (
                     consumption.permit.permit_id
                 )

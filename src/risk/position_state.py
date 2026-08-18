@@ -748,25 +748,52 @@ class PositionBook:
                     record.priced_quantity += delta_size
                     record.cost_basis += max(0.0, delta_notional)
 
-        # Equal-quantity stronger price correction adjusts known cost basis by the
-        # cumulative notional correction rather than inventing another fill.
+        # Equal-quantity stronger price evidence can either correct an already
+        # priced cumulative execution or hydrate quantity that was previously
+        # confirmed without an exact realized price.
         if (
             previous is not None
             and abs(new_size - previous.cumulative_size)
             <= self.quantity_epsilon
             and new_notional is not None
-            and previous.cumulative_notional is not None
         ):
-            correction = new_notional - previous.cumulative_notional
+            if previous.cumulative_notional is not None:
+                correction = new_notional - previous.cumulative_notional
 
-            if (
-                previous.cumulative_size
-                <= record.priced_quantity + self.quantity_epsilon
-            ):
-                record.cost_basis = max(
-                    0.0,
-                    record.cost_basis + correction,
+                if (
+                    previous.cumulative_size
+                    <= record.priced_quantity + self.quantity_epsilon
+                ):
+                    record.cost_basis = max(
+                        0.0,
+                        record.cost_basis + correction,
+                    )
+            else:
+                hydrate_quantity = min(
+                    previous.cumulative_size,
+                    max(
+                        0.0,
+                        record.quantity - record.priced_quantity,
+                    ),
                 )
+
+                if hydrate_quantity > self.quantity_epsilon:
+                    average = (
+                        new_notional / new_size
+                        if new_size > self.quantity_epsilon
+                        else 0.0
+                    )
+                    record.priced_quantity += hydrate_quantity
+                    record.cost_basis += hydrate_quantity * average
+                    self._append_anomaly(
+                        record,
+                        code="LATE_BUY_PRICE_HYDRATION",
+                        message=(
+                            f"late exact price hydrated "
+                            f"{hydrate_quantity:.8f} confirmed BUY inventory"
+                        ),
+                        observed_at=observed_at,
+                    )
 
     def _apply_sell_cumulative_delta(
         self,

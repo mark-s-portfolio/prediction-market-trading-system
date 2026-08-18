@@ -431,10 +431,10 @@ class SubmissionResult:
 
     @property
     def requires_reconciliation(self) -> bool:
-        return self.ambiguous or (
-            self.post_call_entered
-            and self.outcome is SubmissionOutcome.FAILED_BEFORE_SUBMIT
-        )
+        # Reconciliation is owned only by the explicit UNKNOWN outcome. A
+        # FAILED_BEFORE_SUBMIT result is, by contract, a confirmed local no-post
+        # result and must not be reinterpreted from a contradictory flag.
+        return self.ambiguous
 
 
 @dataclass(frozen=True, slots=True)

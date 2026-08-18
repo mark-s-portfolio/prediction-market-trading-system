@@ -39,7 +39,7 @@ import time
 from typing import Dict, Iterable, Optional, Protocol, Sequence, Tuple
 
 from src.execution.order_lifecycle import LifecycleSnapshot
-from src.execution.types import OrderLifecycleState
+from src.execution.types import LifecycleIdentity, OrderLifecycleState
 from src.market.types import OutcomeSide
 from src.risk.position_state import CostBasisState, PositionBook, PositionSnapshot
 
@@ -313,11 +313,20 @@ class RiskCheck:
 
 @dataclass(frozen=True, slots=True)
 class RiskDecision:
+    """Immutable risk verdict bound to one exact ProposedExposure."""
+
+    proposal: ProposedExposure
     action: RiskAction
     allowed: bool
     mode: RiskMode
     checks: Tuple[RiskCheck, ...]
     snapshot: PortfolioRiskSnapshot
+
+    def __post_init__(self) -> None:
+        if self.action is not self.proposal.action:
+            raise ValueError(
+                "risk decision action must match bound proposal action"
+            )
 
     @property
     def hard_failures(self) -> Tuple[RiskCheck, ...]:
@@ -684,7 +693,11 @@ class RiskManager:
 
         return RiskMode.NORMAL
 
-    def snapshot(self) -> PortfolioRiskSnapshot:
+    def snapshot(
+        self,
+        *,
+        exclude_lifecycle: Optional[LifecycleIdentity] = None,
+    ) -> PortfolioRiskSnapshot:
         now = time.time()
         positions = self.positions.open_snapshots()
         market_exposures = self._market_exposures(positions)
@@ -748,7 +761,14 @@ class RiskManager:
             default=0.0,
         )
 
-        owners = self.execution_ownership.owned_snapshots()
+        owners = tuple(
+            owner
+            for owner in self.execution_ownership.owned_snapshots()
+            if (
+                exclude_lifecycle is None
+                or owner.lifecycle != exclude_lifecycle
+            )
+        )
 
         unresolved_tokens = tuple(
             sorted(
@@ -835,10 +855,14 @@ class RiskManager:
     def assess(
         self,
         proposal: ProposedExposure,
+        *,
+        exclude_lifecycle: Optional[LifecycleIdentity] = None,
     ) -> RiskDecision:
         """Evaluate generic portfolio capacity for one economic action."""
 
-        snapshot = self.snapshot()
+        snapshot = self.snapshot(
+            exclude_lifecycle=exclude_lifecycle
+        )
         checks: list[RiskCheck] = []
 
         # Risk reduction and reconciliation must remain reachable in reduce-only
@@ -872,6 +896,7 @@ class RiskManager:
             )
 
             return RiskDecision(
+                proposal=proposal,
                 action=proposal.action,
                 allowed=allowed,
                 mode=snapshot.mode,
@@ -896,7 +921,13 @@ class RiskManager:
         same_token_owners = [
             owner
             for owner in self.execution_ownership.owned_snapshots()
-            if owner.working_order.intent.token_id == proposal.token_id
+            if (
+                owner.working_order.intent.token_id == proposal.token_id
+                and (
+                    exclude_lifecycle is None
+                    or owner.lifecycle != exclude_lifecycle
+                )
+            )
         ]
 
         checks.append(
@@ -1226,6 +1257,7 @@ class RiskManager:
         )
 
         return RiskDecision(
+            proposal=proposal,
             action=proposal.action,
             allowed=allowed,
             mode=snapshot.mode,

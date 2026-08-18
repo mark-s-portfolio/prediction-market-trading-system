@@ -1,4 +1,3 @@
-
 # Prediction Market Trading System
 
 A **sanitized portfolio edition** of an event-driven prediction-market trading and execution system built in Python.
@@ -145,4 +144,3 @@ The tests emphasize invariants rather than happy-path mocks. Examples include:
 ## Status
 
 This is a **portfolio snapshot**, not a packaged trading product or financial-performance claim. The standalone composition root is designed for architecture review and observe-only demonstration.
-
