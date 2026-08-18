@@ -152,12 +152,6 @@ class MarkovTransitionModel:
             self.states_count - 1,
         )
 
-    def _invalidate_probability_generation(self) -> None:
-        self._prob_cache = None
-        self._simulation_cdf_cache = None
-        self._simulation_cdf_generation = -1
-        self._simulation_result_cache.clear()
-
     def anchor(self, price: float, *, timestamp: Optional[float] = None) -> int:
         """Set current state without recording a transition.
 
@@ -173,11 +167,16 @@ class MarkovTransitionModel:
             raise ValueError("timestamp must be positive")
 
         with self._gate:
+            if (
+                self.last_update_time is not None
+                and observed < self.last_update_time - 1e-12
+            ):
+                raise ValueError("timestamp cannot move backwards")
+
             self.history.append(float(price))
             self.last_state = state
             self.last_update_time = observed
             self._tick_count += 1
-            self._invalidate_probability_generation()
 
         return state
 
@@ -191,6 +190,12 @@ class MarkovTransitionModel:
             raise ValueError("timestamp must be positive")
 
         with self._gate:
+            if (
+                self.last_update_time is not None
+                and observed < self.last_update_time - 1e-12
+            ):
+                raise ValueError("timestamp cannot move backwards")
+
             self.history.append(float(price))
 
             if self.last_state is not None and self.last_update_time is not None:
@@ -212,7 +217,6 @@ class MarkovTransitionModel:
             self.last_state = state
             self.last_update_time = observed
             self._tick_count += 1
-            self._invalidate_probability_generation()
 
         return state
 
@@ -324,10 +328,16 @@ class MarkovTransitionModel:
         simulations = int(simulations)
         max_steps = int(max_steps)
 
-        if not math.isfinite(target_distance) or target_distance <= 0.0:
-            raise ValueError("target_distance must be positive")
-        if not math.isfinite(stop_distance) or stop_distance <= 0.0:
-            raise ValueError("stop_distance must be positive")
+        if (
+            not math.isfinite(target_distance)
+            or not 0.0 < target_distance <= 1.0
+        ):
+            raise ValueError("target_distance must be in (0, 1]")
+        if (
+            not math.isfinite(stop_distance)
+            or not 0.0 < stop_distance <= 1.0
+        ):
+            raise ValueError("stop_distance must be in (0, 1]")
         if simulations < 1:
             raise ValueError("simulations must be positive")
         if max_steps < 1:
@@ -347,6 +357,37 @@ class MarkovTransitionModel:
 
         cdf, generation = self._simulation_cdf()
         one_step_up = self.row_probability_above_current(current_price)
+
+        # Exact first-passage boundary semantics. If the starting state is
+        # already on a boundary because target/stop clamped to the state-space
+        # edge, the result is known before any stochastic transition occurs.
+        if current_state >= target_state:
+            return FirstPassageResult(
+                target_probability=1.0,
+                representative_peak_state=current_state,
+                one_step_up_probability=one_step_up,
+                current_state=current_state,
+                target_state=target_state,
+                stop_state=stop_state,
+                simulations=simulations,
+                max_steps=max_steps,
+                probability_generation=generation,
+                seed=seed,
+            )
+
+        if current_state <= stop_state:
+            return FirstPassageResult(
+                target_probability=0.0,
+                representative_peak_state=current_state,
+                one_step_up_probability=one_step_up,
+                current_state=current_state,
+                target_state=target_state,
+                stop_state=stop_state,
+                simulations=simulations,
+                max_steps=max_steps,
+                probability_generation=generation,
+                seed=seed,
+            )
 
         # Only seeded calls are memoized.  Caching an unseeded Monte Carlo result
         # would make a stochastic draw look deterministic for the rest of one model
@@ -558,6 +599,27 @@ class PersistentMarkovView:
     ) -> None:
         observed = float(timestamp if timestamp is not None else time.time())
         price = float(price)
+
+        # Validate before mutating view-local metadata so invalid observations are
+        # atomic failures rather than partially recorded ticks.
+        self.local_model.state_for_price(price)
+        if not math.isfinite(observed) or observed <= 0.0:
+            raise ValueError("timestamp must be positive")
+
+        local_last = self.local_model.last_update_time
+        backing_last = self.backing.last_update_time
+
+        if (
+            local_last is not None
+            and observed < local_last - 1e-12
+        ):
+            raise ValueError("timestamp cannot move backwards")
+
+        if (
+            backing_last is not None
+            and observed < backing_last - 1e-12
+        ):
+            raise ValueError("timestamp cannot move backwards")
 
         if self.local_tick_count == 0:
             self.local_first_update_time = observed
